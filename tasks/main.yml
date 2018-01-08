@@ -1,0 +1,88 @@
+---
+
+- name: Update Repo Cache
+  apt:
+    update_cache: yes
+
+- name: Download kubectl
+  get_url: 
+    url: https://storage.googleapis.com/kubernetes-release/release/v1.7.0/bin/linux/amd64/kubectl
+    dest: /tmp/kubectl.sh
+  when: "'kube-masters' in group_names"
+
+- name: Deploy kubectl
+  copy:
+    src: /tmp/kubectl.sh
+    dest: /usr/bin/kubectl
+    remote_src: true
+    mode: 0755
+  when: "'kube-masters' in group_names"
+
+- name: Add apt-key
+  apt_key: 
+    url: "https://packages.cloud.google.com/apt/doc/apt-key.gpg"
+    state: present
+
+- name: Add Repo
+  apt_repository:
+    repo: "deb http://apt.kubernetes.io/ kubernetes-xenial main"
+    state: present
+
+- name: Install kubelet and kubeadm
+  apt:
+    pkg: "{{ item }}"
+    update_cache: yes
+  with_items:
+    - kubelet
+    - kubeadm 
+
+- name: Cluster Token Generation
+  shell: /usr/bin/kubeadm token generate
+  register: kubeadm_token_generate
+  when: 
+    - kubeadm_token is not defined
+    - "'kube-masters' in group_names"
+
+- name: Setting Facts
+  set_fact: kubeadm_token="{{ kubeadm_token_generate.stdout }}"
+  when: 
+    - kubeadm_token is not defined
+    - kubeadm_token_generate is defined
+    - "'kube-masters' in group_names"
+
+
+- name: Cluster Initialization
+  shell: /usr/bin/kubeadm init --token "{{ kubeadm_token }}" --pod-network-cidr=10.244.0.0/16 --apiserver-bind-port "{{ kubeadm_port }}"
+  when: "'kube-masters' in group_names"
+  ignore_errors: yes
+
+- name: copy kubernetes admin.conf
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/admin.conf
+    owner: root
+    group: root
+    remote_src: yes
+  when: "'kube-masters' in group_names"
+
+- name: Master Set Env Vars
+  shell: echo "export KUBECONFIG=/root/admin.conf" >> /root/.profile
+  when: "'kube-masters' in group_names"
+
+- name: Installing Flannel Pod Network
+  shell: "KUBECONFIG=/root/admin.conf kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml && KUBECONFIG=/root/admin.conf kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel-rbac.yml"
+  when: "'kube-masters' in group_names"
+  ignore_errors: yes
+
+- name: Waiting for Network Pod Deployement
+  pause:
+    minutes: 2
+
+- name: Set Token Fact from Master to Nodes
+  set_fact: kubeadm_token="{{ hostvars[groups['kube-masters'][0]]['kubeadm_token'] }}"
+  when: "'kube-nodes' in group_names"
+
+- name: Joining Nodes
+  shell: kubeadm join --token "{{ kubeadm_token }}" "{{ groups['kube-masters'][0] }}":"{{ kubeadm_port }}"
+  when: "'kube-nodes' in group_names"
+  ignore_errors: yes
